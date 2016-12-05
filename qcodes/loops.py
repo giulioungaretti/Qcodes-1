@@ -61,7 +61,7 @@ from qcodes.utils.helpers import wait_secs, full_class, tprint
 from qcodes.process.qcodes_process import QcodesProcess
 from qcodes.utils.metadata import Metadatable
 
-from .actions import (_actions_snapshot, Task, Wait, _Measure, _Nest,
+from .actions import (_actions_snapshot, Task, Wait, _Nest,
                       BreakIf, _QcodesBreak)
 
 # Switches off multiprocessing by default, cant' be altered after module
@@ -412,7 +412,6 @@ class ActiveLoop(Metadatable):
         self.bg_task = bg_task
         self.bg_final_task = bg_final_task
         self.bg_min_delay = bg_min_delay
-        self.data_set = None
 
         # compile now, but don't save the results
         # just used for preemptive error checking
@@ -427,7 +426,7 @@ class ActiveLoop(Metadatable):
         # if the first action is another loop, it changes how delays
         # happen - the outer delay happens *after* the inner var gets
         # set to its initial value
-        self._nest_first = hasattr(actions[0], 'containers')
+        self._nest_first = type(actions[0]) == ActiveLoop
 
         # for sending halt signals to the loop
         self.signal_queue = mp.Queue()
@@ -482,247 +481,6 @@ class ActiveLoop(Metadatable):
             'then_actions': _actions_snapshot(self.then_actions, update)
         }
 
-    def containers(self):
-        """
-        Finds the data arrays that will be created by the actions in this
-        loop, and nests them inside this level of the loop.
-
-        Recursively calls `.containers` on any enclosed actions.
-        """
-        loop_size = len(self.sweep_values)
-        data_arrays = []
-        loop_array = DataArray(parameter=self.sweep_values.parameter,
-                               is_setpoint=True)
-        loop_array.nest(size=loop_size)
-
-        data_arrays = [loop_array]
-        # hack set_data into actions
-        new_actions = self.actions[:]
-        if hasattr(self.sweep_values, "parameters"):
-            for parameter in self.sweep_values.parameters:
-                new_actions.append(parameter)
-
-        for i, action in enumerate(new_actions):
-            if hasattr(action, 'containers'):
-                action_arrays = action.containers()
-
-            elif hasattr(action, 'get'):
-                # this action is a parameter to measure
-                # note that this supports lists (separate output arrays)
-                # and arrays (nested in one/each output array) of return values
-                action_arrays = self._parameter_arrays(action)
-
-            else:
-                # this *is* covered but the report misses it because Python
-                # optimizes it away. See:
-                # https://bitbucket.org/ned/coveragepy/issues/198
-                continue  # pragma: no cover
-
-            for array in action_arrays:
-                array.nest(size=loop_size, action_index=i,
-                           set_array=loop_array)
-            data_arrays.extend(action_arrays)
-
-        return data_arrays
-
-    def _parameter_arrays(self, action):
-        out = []
-
-        # first massage all the input parameters to the general multi-name form
-        if hasattr(action, 'names'):
-            names = action.names
-            full_names = action.full_names
-            labels = getattr(action, 'labels', names)
-            if len(labels) != len(names):
-                raise ValueError('must have equal number of names and labels')
-            action_indices = tuple((i,) for i in range(len(names)))
-        elif hasattr(action, 'name'):
-            names = (action.name,)
-            full_names = (action.full_name,)
-            labels = (getattr(action, 'label', action.name),)
-            action_indices = ((),)
-        else:
-            raise ValueError('a gettable parameter must have .name or .names')
-
-        num_arrays = len(names)
-        shapes = getattr(action, 'shapes', None)
-        sp_vals = getattr(action, 'setpoints', None)
-        sp_names = getattr(action, 'setpoint_names', None)
-        sp_labels = getattr(action, 'setpoint_labels', None)
-
-        if shapes is None:
-            shapes = (getattr(action, 'shape', ()),) * num_arrays
-            sp_vals = (sp_vals,) * num_arrays
-            sp_names = (sp_names,) * num_arrays
-            sp_labels = (sp_labels,) * num_arrays
-        else:
-            sp_blank = (None,) * num_arrays
-            # _fill_blank both supplies defaults and tests length
-            # if values are supplied (for shapes it ONLY tests length)
-            shapes = self._fill_blank(shapes, sp_blank)
-            sp_vals = self._fill_blank(sp_vals, sp_blank)
-            sp_names = self._fill_blank(sp_names, sp_blank)
-            sp_labels = self._fill_blank(sp_labels, sp_blank)
-
-        # now loop through these all, to make the DataArrays
-        # record which setpoint arrays we've made, so we don't duplicate
-        all_setpoints = {}
-        for name, full_name, label, shape, i, sp_vi, sp_ni, sp_li in zip(
-                names, full_names, labels, shapes, action_indices,
-                sp_vals, sp_names, sp_labels):
-
-            if shape is None or shape == ():
-                shape, sp_vi, sp_ni, sp_li = (), (), (), ()
-            else:
-                sp_blank = (None,) * len(shape)
-                sp_vi = self._fill_blank(sp_vi, sp_blank)
-                sp_ni = self._fill_blank(sp_ni, sp_blank)
-                sp_li = self._fill_blank(sp_li, sp_blank)
-
-            setpoints = ()
-            # loop through dimensions of shape to make the setpoint arrays
-            for j, (vij, nij, lij) in enumerate(zip(sp_vi, sp_ni, sp_li)):
-                sp_def = (shape[: 1 + j], j, setpoints, vij, nij, lij)
-                if sp_def not in all_setpoints:
-                    all_setpoints[sp_def] = self._make_setpoint_array(*sp_def)
-                    out.append(all_setpoints[sp_def])
-                setpoints = setpoints + (all_setpoints[sp_def],)
-
-            # finally, make the output data array with these setpoints
-            out.append(DataArray(name=name, full_name=full_name, label=label,
-                                 shape=shape, action_indices=i,
-                                 set_arrays=setpoints, parameter=action))
-
-        return out
-
-    def _fill_blank(self, inputs, blanks):
-        if inputs is None:
-            return blanks
-        elif len(inputs) == len(blanks):
-            return inputs
-        else:
-            raise ValueError('Wrong number of inputs supplied')
-
-    def _make_setpoint_array(self, shape, i, prev_setpoints, vals, name,
-                             label):
-        if vals is None:
-            vals = self._default_setpoints(shape)
-        elif isinstance(vals, DataArray):
-            # can't simply use the DataArray, even though that's
-            # what we're going to return here, because it will
-            # get nested (don't want to alter the original)
-            # DataArrays do have the advantage though of already including
-            # name and label, so take these if they exist
-            if vals.name is not None:
-                name = vals.name
-            if vals.label is not None:
-                label = vals.label
-
-            # extract a copy of the numpy array
-            vals = np.array(vals.ndarray)
-        else:
-            # turn any sequence into a (new) numpy array
-            vals = np.array(vals)
-
-        if vals.shape != shape:
-            raise ValueError('nth setpoint array should have shape matching '
-                             'the first n dimensions of shape.')
-
-        if name is None:
-            name = 'index{}'.format(i)
-
-        return DataArray(name=name, label=label, set_arrays=prev_setpoints,
-                         shape=shape, preset_data=vals)
-
-    def _default_setpoints(self, shape):
-        if len(shape) == 1:
-            return np.arange(0, shape[0], 1)
-
-        sp = np.ndarray(shape)
-        sp_inner = self._default_setpoints(shape[1:])
-        for i in range(len(sp)):
-            sp[i] = sp_inner
-
-        return sp
-
-    def set_common_attrs(self, data_set, use_threads, signal_queue):
-        """
-        set a couple of common attributes that the main and nested loops
-        all need to have:
-        - the DataSet collecting all our measurements
-        - a queue for communicating with the main process
-        """
-        self.data_set = data_set
-        self.signal_queue = signal_queue
-        self.use_threads = use_threads
-        for action in self.actions:
-            if hasattr(action, 'set_common_attrs'):
-                action.set_common_attrs(data_set, use_threads, signal_queue)
-
-    def _check_signal(self):
-        while not self.signal_queue.empty():
-            signal_ = self.signal_queue.get()
-            if signal_ == self.HALT:
-                raise _QuietInterrupt('sweep was halted')
-            elif signal_ == self.HALT_DEBUG:
-                raise _DebugInterrupt('sweep was halted')
-            else:
-                raise ValueError('unknown signal', signal_)
-
-    def get_data_set(self, data_manager=USE_MP, *args, **kwargs):
-        """
-        Return the data set for this loop.
-
-        If no data set has been created yet, a new one will be created and
-        returned. Note that all arguments can only be provided when the
-        `DataSet` is first created; giving these during `run` when
-        `get_data_set` has already been called on its own is an error.
-
-        data_manager: a DataManager instance (omit to use default,
-            False to store locally)
-
-        kwargs are passed along to data_set.new_data. The key ones are:
-        location: the location of the DataSet, a string whose meaning
-            depends on formatter and io, or False to only keep in memory.
-            May be a callable to provide automatic locations. If omitted, will
-            use the default DataSet.location_provider
-        name: if location is default or another provider function, name is
-            a string to add to location to make it more readable/meaningful
-            to users
-        formatter: knows how to read and write the file format
-            default can be set in DataSet.default_formatter
-        io: knows how to connect to the storage (disk vs cloud etc)
-        write_period: how often to save to storage during the loop.
-            default 5 sec, use None to write only at the end
-
-        returns:
-            a DataSet object that we can use to plot
-        """
-        if self.data_set is None:
-            if data_manager is False:
-                data_mode = DataMode.LOCAL
-            else:
-                warnings.warn("Multiprocessing is in beta, use at own risk",
-                              UserWarning)
-                data_mode = DataMode.PUSH_TO_SERVER
-
-            data_set = new_data(arrays=self.containers(), mode=data_mode,
-                                data_manager=data_manager, *args, **kwargs)
-
-            self.data_set = data_set
-
-        else:
-            has_args = len(kwargs) or len(args)
-            uses_data_manager = (self.data_set.mode != DataMode.LOCAL)
-            if has_args or (uses_data_manager != data_manager):
-                raise RuntimeError(
-                    'The DataSet for this loop already exists. '
-                    'You can only provide DataSet attributes, such as '
-                    'data_manager, location, name, formatter, io, '
-                    'write_period, when the DataSet is first created.')
-
-        return self.data_set
-
     def run_temp(self, **kwargs):
         """
         wrapper to run this loop in the foreground as a temporary data set,
@@ -776,107 +534,33 @@ class ActiveLoop(Metadatable):
         if progress_interval is not False:
             self.progress_interval = progress_interval
 
-        prev_loop = get_bg()
-        if prev_loop:
-            if not quiet:
-                print('Waiting for the previous background Loop to finish...',
-                      flush=True)
-            prev_loop.join()
-
-        data_set = self.get_data_set(data_manager, *args, **kwargs)
-
-        if background and not getattr(data_set, 'data_manager', None):
-            warnings.warn(
-                'With background=True you must also set data_manager=True '
-                'or you will not be able to sync your DataSet.',
-                UserWarning)
-
-        self.set_common_attrs(data_set=data_set, use_threads=use_threads,
-                              signal_queue=self.signal_queue)
 
         station = station or self.station or Station.default
         if station:
             data_set.add_metadata({'station': station.snapshot()})
 
         # information about the loop definition is in its snapshot
-        data_set.add_metadata({'loop': self.snapshot()})
+        # TODO: this is supposedly json so just send it
+        # data_set.add_metadata({'loop': self.snapshot()})
         # then add information about how and when it was run
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        data_set.add_metadata({'loop': {
-            'ts_start': ts,
-            'background': background,
-            'use_threads': use_threads,
-            'use_data_manager': (data_manager is not False)
-        }})
+        # ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # data_set.add_metadata({'loop': {
+            # 'ts_start': ts,
+            # 'background': background,
+            # 'use_threads': use_threads,
+            # 'use_data_manager': (data_manager is not False)
+        # }})
 
-        data_set.save_metadata()
-
-        if prev_loop and not quiet:
-            print('...done. Starting ' + (data_set.location or 'new loop'),
-                  flush=True)
-
-        try:
-            if background:
-                warnings.warn("Multiprocessing is in beta, use at own risk",
-                              UserWarning)
-                p = QcodesProcess(target=self._run_wrapper, name=MP_NAME)
-                p.is_sweep = True
-                p.signal_queue = self.signal_queue
-                p.start()
-                self.process = p
-
-                # now that the data_set we created has been put in the loop
-                # process, this copy turns into a reader
-                # if you're not using a DataManager, it just stays local
-                # and sync() reads from disk
-                if self.data_set.mode == DataMode.PUSH_TO_SERVER:
-                    self.data_set.mode = DataMode.PULL_FROM_SERVER
-                self.data_set.sync()
-            else:
-                if hasattr(self, 'process'):
-                    # in case this ActiveLoop was run before in the background
-                    del self.process
-
-                self._run_wrapper()
-
-                if self.data_set.mode != DataMode.LOCAL:
-                    self.data_set.sync()
-
-            ds = self.data_set
-
-        finally:
-            if not quiet:
-                print(repr(self.data_set))
-                print(datetime.now().strftime('started at %Y-%m-%d %H:%M:%S'))
-
-            # After normal loop execution we clear the data_set so we can run
-            # again. But also if something went wrong during the loop execution
-            # we want to clear the data_set attribute so we don't try to reuse
-            # this one later.
-            self.data_set = None
-
-
-        return ds
+        self._run_wrapper()
 
     def _compile_actions(self, actions, action_indices=()):
         callables = []
-        measurement_group = []
         for i, action in enumerate(actions):
             new_action_indices = action_indices + (i,)
             if hasattr(action, 'get'):
-                measurement_group.append((action, new_action_indices))
-                continue
-            elif measurement_group:
-                callables.append(_Measure(measurement_group, self.data_set,
-                                          self.use_threads))
-                measurement_group[:] = []
-
-            callables.append(self._compile_one(action, new_action_indices))
-
-        if measurement_group:
-            callables.append(_Measure(measurement_group, self.data_set,
-                                      self.use_threads))
-            measurement_group[:] = []
+                callables.append((action, new_action_indices))
+            else:
+                callables.append((self._compile_one(action, new_action_indices), new_action_indices))
 
         return callables
 
@@ -932,36 +616,20 @@ class ActiveLoop(Metadatable):
                     self.sweep_values.name, i, imax, time.time() - t0),
                     dt=self.progress_interval, tag='outerloop')
 
-            set_val = self.sweep_values.set(value)
+            self.sweep_values.set(value)
 
             new_indices = loop_indices + (i,)
-            new_values = current_values + (value,)
-            data_to_store = {}
-
-            if hasattr(self.sweep_values, "parameters"):
-                set_name = self.data_set.action_id_map[action_indices]
-                if hasattr(self.sweep_values, 'aggregate'):
-                    value = self.sweep_values.aggregate(*set_val)
-                self.data_set.store(new_indices, {set_name: value})
-                for j, val in enumerate(set_val):
-                    set_index = action_indices + (j+1, )
-                    set_name = (self.data_set.action_id_map[set_index])
-                    data_to_store[set_name] = val
-            else:
-                set_name = self.data_set.action_id_map[action_indices]
-                data_to_store[set_name] = value
-
-            self.data_set.store(new_indices, data_to_store)
+            print("{} >>>>> {} at {}".format(self.sweep_values.name, value, i))
 
             if not self._nest_first:
                 # only wait the delay time if an inner loop will not inherit it
                 self._wait(delay)
 
             try:
-                for f in callables:
-                    f(first_delay=delay,
-                      loop_indices=new_indices,
-                      current_values=new_values)
+                for f, index in callables:
+                    name = f.name
+                    val = f()
+                    print("{}<<<<<< {}-{}-{}".format(name, val, index, new_indices))
 
                     # after the first action, no delay is inherited
                     delay = 0
@@ -1012,22 +680,12 @@ class ActiveLoop(Metadatable):
     def _wait(self, delay):
         if delay:
             finish_clock = time.perf_counter() + delay
-
-            if self._monitor:
-                # TODO - perhpas pass self._check_signal in here
-                # so that we can halt within monitor.call if it
-                # lasts a very long time?
-                self._monitor.call(finish_by=finish_clock)
-
             while True:
                 self._check_signal()
                 t = wait_secs(finish_clock)
                 time.sleep(min(t, self.signal_period))
                 if t <= self.signal_period:
                     break
-        else:
-            self._check_signal()
-
 
 class _QuietInterrupt(Exception):
     pass

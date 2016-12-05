@@ -97,55 +97,6 @@ class Wait:
         return {'type': 'Wait', 'delay': self.delay}
 
 
-class _Measure:
-    """
-    A callable collection of parameters to measure.
-
-    This should not be constructed manually, only by an ActiveLoop.
-    """
-    def __init__(self, params_indices, data_set, use_threads):
-        self.use_threads = use_threads and len(params_indices) > 1
-        # the applicable DataSet.store function
-        self.store = data_set.store
-
-        # for performance, pre-calculate which params return data for
-        # multiple arrays, and the name mappings
-        self.getters = []
-        self.param_ids = []
-        self.composite = []
-        for param, action_indices in params_indices:
-            self.getters.append(param.get)
-
-            if hasattr(param, 'names'):
-                part_ids = []
-                for i in range(len(param.names)):
-                    param_id = data_set.action_id_map[action_indices + (i,)]
-                    part_ids.append(param_id)
-                self.param_ids.append(None)
-                self.composite.append(part_ids)
-            else:
-                param_id = data_set.action_id_map[action_indices]
-                self.param_ids.append(param_id)
-                self.composite.append(False)
-
-    def __call__(self, loop_indices, **ignore_kwargs):
-        out_dict = {}
-        if self.use_threads:
-            out = thread_map(self.getters)
-        else:
-            out = [g() for g in self.getters]
-
-        for param_out, param_id, composite in zip(out, self.param_ids,
-                                                  self.composite):
-            if composite:
-                for val, part_id in zip(param_out, composite):
-                    out_dict[part_id] = val
-            else:
-                out_dict[param_id] = param_out
-
-        self.store(loop_indices, out_dict)
-
-
 class _Nest:
 
     """
@@ -157,9 +108,12 @@ class _Nest:
     def __init__(self, inner_loop, action_indices):
         self.inner_loop = inner_loop
         self.action_indices = action_indices
+        self.name = "nested loop {}".format(action_indices)
 
     def __call__(self, **kwargs):
+        print("{}".format(self.action_indices))
         self.inner_loop._run_loop(action_indices=self.action_indices, **kwargs)
+        return "inner_loop"
 
 
 class BreakIf:
