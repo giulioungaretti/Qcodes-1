@@ -49,19 +49,14 @@ Supported commands to .set_measurement or .each are:
 from datetime import datetime
 import multiprocessing as mp
 import time
-import numpy as np
-import warnings
 
 from qcodes import config
 from qcodes.station import Station
-from qcodes.data.data_set import new_data, DataMode
-from qcodes.data.data_array import DataArray
 from qcodes.data.manager import get_data_manager
 from qcodes.utils.helpers import wait_secs, full_class, tprint
-from qcodes.process.qcodes_process import QcodesProcess
 from qcodes.utils.metadata import Metadatable
 
-from .actions import (_actions_snapshot, Task, Wait, _Nest,
+from .actions import (_actions_snapshot, Task, Wait,
                       BreakIf, _QcodesBreak)
 
 # Switches off multiprocessing by default, cant' be altered after module
@@ -250,7 +245,9 @@ class Loop(Metadatable):
         return ActiveLoop(self.sweep_values, self.delay, *actions,
                           then_actions=self.then_actions, station=self.station,
                           progress_interval=self.progress_interval,
-                          bg_task=self.bg_task, bg_final_task=self.bg_final_task, bg_min_delay=self.bg_min_delay)
+                          bg_task=self.bg_task,
+                          bg_final_task=self.bg_final_task,
+                          bg_min_delay=self.bg_min_delay)
 
     def with_bg_task(self, task, bg_final_task=None, min_delay=0.01):
         """
@@ -260,14 +257,14 @@ class Loop(Metadatable):
             task: A callable object with no parameters. This object will be
                 invoked periodically during the measurement loop.
 
-            bg_final_task: A callable object with no parameters. This object will be
-                invoked to clean up after or otherwise finish the background
-                task work.
+            bg_final_task: A callable object with no parameters. This object
+                will be invoked to clean up after or otherwise finish the
+                background task work.
 
             min_delay (default 0.01): The minimum number of seconds to wait
                 between task invocations.
-                Note that if a task is doing a lot of processing it is recommended
-                to increase min_delay.
+                Note that if a task is doing a lot of processing it is
+                recommended to increase min_delay.
                 Note that the actual time between task invocations may be much
                 longer than this, as the task is only run between passes
                 through the loop.
@@ -460,7 +457,8 @@ class ActiveLoop(Metadatable):
             task: A callable object with no parameters. This object will be
                 invoked periodically during the measurement loop.
 
-            bg_final_task: A callable object with no parameters. This object will be
+            bg_final_task: A callable object with no parameters. This
+                object will be
                 invoked to clean up after or otherwise finish the background
                 task work.
 
@@ -534,10 +532,9 @@ class ActiveLoop(Metadatable):
         if progress_interval is not False:
             self.progress_interval = progress_interval
 
-
         station = station or self.station or Station.default
-        if station:
-            data_set.add_metadata({'station': station.snapshot()})
+        # if station:
+            # data_set.add_metadata({'station': station.snapshot()})
 
         # information about the loop definition is in its snapshot
         # TODO: this is supposedly json so just send it
@@ -552,25 +549,6 @@ class ActiveLoop(Metadatable):
         # }})
 
         self._run_wrapper()
-
-    def _compile_actions(self, actions, action_indices=()):
-        callables = []
-        for i, action in enumerate(actions):
-            new_action_indices = action_indices + (i,)
-            if hasattr(action, 'get'):
-                callables.append((action, new_action_indices))
-            else:
-                callables.append((self._compile_one(action, new_action_indices), new_action_indices))
-
-        return callables
-
-    def _compile_one(self, action, new_action_indices):
-        if isinstance(action, Wait):
-            return Task(self._wait, action.delay)
-        elif isinstance(action, ActiveLoop):
-            return _Nest(action, new_action_indices)
-        else:
-            return action
 
     def _run_wrapper(self, *args, **kwargs):
         try:
@@ -604,12 +582,9 @@ class ActiveLoop(Metadatable):
         # the loop parameter may be increased if an outer loop requested longer
         delay = max(self.delay, first_delay)
 
-        callables = self._compile_actions(self.actions, action_indices)
-
         t0 = time.time()
-        last_task = t0
-        last_task_failed = False
         imax = len(self.sweep_values)
+        id = "very_unique_such_wow"
         for i, value in enumerate(self.sweep_values):
             if self.progress_interval is not None:
                 tprint('loop %s: %d/%d (%.1f [s])' % (
@@ -618,19 +593,18 @@ class ActiveLoop(Metadatable):
 
             self.sweep_values.set(value)
 
-            new_indices = loop_indices + (i,)
-            print("{} >>>>> {} at {}".format(self.sweep_values.name, value, i))
-
             if not self._nest_first:
                 # only wait the delay time if an inner loop will not inherit it
                 self._wait(delay)
 
             try:
-                for f, index in callables:
-                    name = f.name
-                    val = f()
-                    print("{}<<<<<< {}-{}-{}".format(name, val, index, new_indices))
-
+                for index, f in enumerate(self.actions):
+                    if type(f) == ActiveLoop:
+                        f._run_loop()
+                    else:
+                        val = f()
+                        name = f.name
+                        print("loop {} index{} at setpoint {}, action {}, {} withvalue {}".format(t0, i, value, index, name, val))
                     # after the first action, no delay is inherited
                     delay = 0
             except _QcodesBreak:
@@ -639,23 +613,6 @@ class ActiveLoop(Metadatable):
             # after the first setpoint, delay reverts to the loop delay
             delay = self.delay
 
-            # now check for a background task and execute it if it's
-            # been long enough since the last time
-            # don't let exceptions in the background task interrupt
-            # the loop
-            # if the background task fails twice consecutively, stop
-            # executing it
-            if self.bg_task is not None:
-                t = time.time()
-                if t - last_task >= self.bg_min_delay:
-                    try:
-                        self.bg_task()
-                        last_task_failed = False
-                    except Exception:
-                        if last_task_failed:
-                            self.bg_task = None
-                        last_task_failed = True
-                    last_task = t
 
         if self.progress_interval is not None:
             # final progress note: set dt=-1 so it *always* prints
@@ -668,14 +625,12 @@ class ActiveLoop(Metadatable):
             self.bg_task()
 
         # the loop is finished - run the .then actions
-        for f in self._compile_actions(self.then_actions, ()):
+        for f in self.then_actions:
             f()
 
         # run the bg_final_task from the bg_task:
         if self.bg_final_task is not None:
             self.bg_final_task()
-
-
 
     def _wait(self, delay):
         if delay:

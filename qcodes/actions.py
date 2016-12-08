@@ -97,24 +97,6 @@ class Wait:
         return {'type': 'Wait', 'delay': self.delay}
 
 
-class _Nest:
-
-    """
-    Wrapper to make a callable nested ActiveLoop.
-
-    This should not be constructed manually, only by an ActiveLoop.
-    """
-
-    def __init__(self, inner_loop, action_indices):
-        self.inner_loop = inner_loop
-        self.action_indices = action_indices
-        self.name = "nested loop {}".format(action_indices)
-
-    def __call__(self, **kwargs):
-        print("{}".format(self.action_indices))
-        self.inner_loop._run_loop(action_indices=self.action_indices, **kwargs)
-        return "inner_loop"
-
 
 class BreakIf:
 
