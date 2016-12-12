@@ -50,93 +50,19 @@ from datetime import datetime
 import multiprocessing as mp
 import time
 
-from qcodes import config
+# from qcodes import config
+
 from qcodes.station import Station
-from qcodes.data.manager import get_data_manager
 from qcodes.utils.helpers import wait_secs, full_class, tprint
 from qcodes.utils.metadata import Metadatable
-
+import zmq
 from .actions import (_actions_snapshot, Task, Wait,
                       BreakIf, _QcodesBreak)
 
-# Switches off multiprocessing by default, cant' be altered after module
-USE_MP = config.core.legacy_mp
-MP_NAME = 'Measurement'
-
-
-def get_bg(return_first=False):
-    """
-    Find the active background measurement process, if any
-    returns None otherwise.
-
-    Todo:
-        RuntimeError message is really hard to understand.
-    Args:
-        return_first(bool): if there are multiple loops running return the
-                            first anyway.
-    Raises:
-        RuntimeError: if multiple loops are active and return_first is False.
-    Returns:
-        Union[loop, None]: active loop or none if no loops are active
-    """
-    processes = mp.active_children()
-    loops = [p for p in processes if getattr(p, 'name', '') == MP_NAME]
-
-    if len(loops) > 1 and not return_first:
-        raise RuntimeError('Oops, multiple loops are running???')
-
-    if loops:
-        return loops[0]
-
-    # if we got here, there shouldn't be a loop running. Make sure the
-    # data manager, if there is one, agrees!
-    _clear_data_manager()
-    return None
-
-
-def halt_bg(timeout=5, traceback=True):
-    """
-    Stop the active background measurement process, if any.
-
-    Args:
-        timeout (int): seconds to wait for a clean exit before forcibly
-         terminating.
-
-        traceback (bool):  whether to print a traceback at the point of
-         interrupt, for debugging purposes.
-    """
-    loop = get_bg(return_first=True)
-    if not loop:
-        print('No loop running')
-        return
-
-    if traceback:
-        signal_ = ActiveLoop.HALT_DEBUG
-    else:
-        signal_ = ActiveLoop.HALT
-
-    loop.signal_queue.put(signal_)
-    loop.join(timeout)
-
-    if loop.is_alive():
-        loop.terminate()
-        loop.join(timeout/2)
-        print('Background loop did not respond to halt signal, terminated')
-
-    _clear_data_manager()
-
-
-def _clear_data_manager():
-    dm = get_data_manager(only_existing=True)
-    if dm and dm.ask('get_measuring'):
-        dm.ask('finalize_data')
-
-# TODO(giulioungaretti) remove dead code
-# def measure(*actions):
-#     # measure has been moved into Station
-#     # TODO - for all-at-once parameters we want to be able to
-#     # store the output into a DataSet without making a Loop.
-#     pass
+# ##### ZMQ #########
+ctx = zmq.Context()
+SOCKET = ctx.socket(zmq.PUB)
+SOCKET.bind("tcp://*:9556")
 
 
 class Loop(Metadatable):
@@ -153,7 +79,6 @@ class Loop(Metadatable):
         is None (no output)
 
     After creating a Loop, you attach `action`s to it, making an `ActiveLoop`
-    TODO: how? Maybe obvious but not specified!
     that you can `.run()`, or you can `.run()` a `Loop` directly, in which
     case it takes the default `action`s from the default `Station`
 
@@ -162,8 +87,9 @@ class Loop(Metadatable):
     data), `Wait` times, or other `ActiveLoop`s or `Loop`s to nest inside
     this one.
     """
+    
     def __init__(self, sweep_values, delay=0, station=None,
-                 progress_interval=None):
+                 progress_interval=None, socket=SOCKET):
         super().__init__()
         if delay < 0:
             raise ValueError('delay must be > 0, not {}'.format(repr(delay)))
@@ -174,10 +100,9 @@ class Loop(Metadatable):
         self.nested_loop = None
         self.actions = None
         self.then_actions = ()
-        self.bg_task = None
-        self.bg_final_task = None
-        self.bg_min_delay = None
         self.progress_interval = progress_interval
+        self.socket = socket
+
 
     def loop(self, sweep_values, delay=0):
         """
@@ -245,31 +170,7 @@ class Loop(Metadatable):
         return ActiveLoop(self.sweep_values, self.delay, *actions,
                           then_actions=self.then_actions, station=self.station,
                           progress_interval=self.progress_interval,
-                          bg_task=self.bg_task,
-                          bg_final_task=self.bg_final_task,
-                          bg_min_delay=self.bg_min_delay)
-
-    def with_bg_task(self, task, bg_final_task=None, min_delay=0.01):
-        """
-        Attaches a background task to this loop.
-
-        Args:
-            task: A callable object with no parameters. This object will be
-                invoked periodically during the measurement loop.
-
-            bg_final_task: A callable object with no parameters. This object
-                will be invoked to clean up after or otherwise finish the
-                background task work.
-
-            min_delay (default 0.01): The minimum number of seconds to wait
-                between task invocations.
-                Note that if a task is doing a lot of processing it is
-                recommended to increase min_delay.
-                Note that the actual time between task invocations may be much
-                longer than this, as the task is only run between passes
-                through the loop.
-        """
-        return _attach_bg_task(self, task, bg_final_task, min_delay)
+                          socket=self.socket)
 
     @staticmethod
     def validate_actions(*actions):
@@ -366,39 +267,22 @@ def _attach_then_actions(loop, actions, overwrite):
     return loop
 
 
-def _attach_bg_task(loop, task, bg_final_task, min_delay):
-    """Inner code for both Loop and ActiveLoop.bg_task"""
-    if loop.bg_task is None:
-        loop.bg_task = task
-        loop.bg_min_delay = min_delay
-    else:
-        raise RuntimeError('Only one background task is allowed per loop')
-
-    if bg_final_task:
-        loop.bg_final_task = bg_final_task
-
-    return loop
-
-
 class ActiveLoop(Metadatable):
     """
+
     Created by attaching actions to a `Loop`, this is the object that actually
-    runs a measurement loop. An `ActiveLoop` can no longer be nested, only run,
+    runs a measurement loop.
+
+    An `ActiveLoop` can no longer be nested, only run,
     or used as an action inside another `Loop` which will run the whole thing.
 
-    The `ActiveLoop` determines what `DataArray`s it will need to hold the data
-    it collects, and it creates a `DataSet` holding these `DataArray`s
+    Active loop streams  data over a PUB socket, wheter or not a SUB is
+    listening.
+
     """
-    # constants for signal_queue
-    HALT = 'HALT LOOP'
-    HALT_DEBUG = 'HALT AND DEBUG'
-
-    # maximum sleep time (secs) between checking the signal_queue for a HALT
-    signal_period = 1
-
+    ID = 0
     def __init__(self, sweep_values, delay, *actions, then_actions=(),
-                 station=None, progress_interval=None, bg_task=None,
-                 bg_final_task=None, bg_min_delay=None):
+                 station=None, progress_interval=None, socket=None):
         super().__init__()
         self.sweep_values = sweep_values
         self.delay = delay
@@ -406,19 +290,7 @@ class ActiveLoop(Metadatable):
         self.progress_interval = progress_interval
         self.then_actions = then_actions
         self.station = station
-        self.bg_task = bg_task
-        self.bg_final_task = bg_final_task
-        self.bg_min_delay = bg_min_delay
-
-        # compile now, but don't save the results
-        # just used for preemptive error checking
-        # if we saved the results, we wouldn't capture nesting
-        # nor would we be able to reuse an ActiveLoop multiple times
-        # within one outer Loop.
-        # TODO: this doesn't work, because _Measure needs the data_set,
-        # which doesn't exist yet - do we want to make a special "dry run"
-        # mode, or is it sufficient to let errors wait until .run()?
-        # self._compile_actions(actions)
+        self.socket = socket
 
         # if the first action is another loop, it changes how delays
         # happen - the outer delay happens *after* the inner var gets
@@ -449,26 +321,6 @@ class ActiveLoop(Metadatable):
                           then_actions=self.then_actions, station=self.station)
         return _attach_then_actions(loop, actions, overwrite)
 
-    def with_bg_task(self, task, bg_final_task=None, min_delay=0.01):
-        """
-        Attaches a background task to this loop.
-
-        Args:
-            task: A callable object with no parameters. This object will be
-                invoked periodically during the measurement loop.
-
-            bg_final_task: A callable object with no parameters. This
-                object will be
-                invoked to clean up after or otherwise finish the background
-                task work.
-
-            min_delay (default 1): The minimum number of seconds to wait
-                between task invocations. Note that the actual time between
-                task invocations may be much longer than this, as the task is
-                only run between passes through the loop.
-        """
-        return _attach_bg_task(self, task, bg_final_task, min_delay)
-
     def snapshot_base(self, update=False):
         """Snapshot of this ActiveLoop's definition."""
         return {
@@ -488,8 +340,7 @@ class ActiveLoop(Metadatable):
         return self.run(background=False, quiet=True,
                         data_manager=False, location=False, **kwargs)
 
-    def run(self, background=USE_MP, use_threads=False, quiet=False,
-            data_manager=USE_MP, station=None, progress_interval=False,
+    def run(self, quiet=False, station=None, progress_interval=False,
             *args, **kwargs):
         """
         Execute this loop.
@@ -549,6 +400,7 @@ class ActiveLoop(Metadatable):
         # }})
 
         self._run_wrapper()
+        self.socket.send_string("DONE")
 
     def _run_wrapper(self, *args, **kwargs):
         try:
@@ -577,6 +429,9 @@ class ActiveLoop(Metadatable):
         signal_queue: queue to communicate with main process directly
         ignore_kwargs: for compatibility with other loop tasks
         """
+        # new active loop
+        ActiveLoop.ID += 1
+        ID = ActiveLoop.ID 
 
         # at the beginning of the loop, the time to wait after setting
         # the loop parameter may be increased if an outer loop requested longer
@@ -584,12 +439,7 @@ class ActiveLoop(Metadatable):
 
         t0 = time.time()
         imax = len(self.sweep_values)
-        id = "very_unique_such_wow"
         for i, value in enumerate(self.sweep_values):
-            if self.progress_interval is not None:
-                tprint('loop %s: %d/%d (%.1f [s])' % (
-                    self.sweep_values.name, i, imax, time.time() - t0),
-                    dt=self.progress_interval, tag='outerloop')
 
             self.sweep_values.set(value)
 
@@ -604,7 +454,12 @@ class ActiveLoop(Metadatable):
                     else:
                         val = f()
                         name = f.name
-                        print("loop {} index{} at setpoint {}, action {}, {} withvalue {}".format(t0, i, value, index, name, val))
+                        self.socket.send_string("{}/{}/{}/{}/{}".format(ID,
+                                                                        i,
+                                                                        value,
+                                                                        index,
+                                                                        name,
+                                                                        val))
                     # after the first action, no delay is inherited
                     delay = 0
             except _QcodesBreak:
@@ -613,24 +468,15 @@ class ActiveLoop(Metadatable):
             # after the first setpoint, delay reverts to the loop delay
             delay = self.delay
 
-
         if self.progress_interval is not None:
             # final progress note: set dt=-1 so it *always* prints
             tprint('loop %s DONE: %d/%d (%.1f [s])' % (
                    self.sweep_values.name, i + 1, imax, time.time() - t0),
                    dt=-1, tag='outerloop')
 
-        # run the background task one last time to catch the last setpoint(s)
-        if self.bg_task is not None:
-            self.bg_task()
-
         # the loop is finished - run the .then actions
         for f in self.then_actions:
             f()
-
-        # run the bg_final_task from the bg_task:
-        if self.bg_final_task is not None:
-            self.bg_final_task()
 
     def _wait(self, delay):
         if delay:
